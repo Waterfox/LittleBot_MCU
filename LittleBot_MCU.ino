@@ -3,6 +3,10 @@
 - applies PID velocity control to 4 motors with _kP, _kI, _kD, _Max_ITerm
 - reports wheel velocity and position travelled between last publish on \enc_feedback
 - all terms are angular position, angular velocity: Mx_theta, Mx_w
+
+references:
+Micro-ROS_reconnection_example
+https://github.com/micro-ROS/micro_ros_arduino/blob/galactic/examples/micro-ros_reconnection_example/micro-ros_reconnection_example.ino
 */
 #include <micro_ros_arduino.h>
 #include <Adafruit_NeoPixel.h>
@@ -16,8 +20,13 @@
 #include <sensor_msgs/msg/joint_state.h>
 #include <std_msgs/msg/int32.h>
 
-#define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){error_loop();}}
+#define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){return false;}}
 #define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){}}
+#define EXECUTE_EVERY_N_MS(MS, X)  do { \
+  static volatile int64_t init = -1; \
+  if (init == -1) { init = uxr_millis();} \
+  if (uxr_millis() - init > MS) { X; init = uxr_millis();} \
+} while (0)\
 
 #define LED_PIN 21
 #define RC_CH1 0
@@ -60,6 +69,13 @@ rcl_allocator_t allocator;
 rcl_node_t node;
 rcl_timer_t timer;
 
+enum states {
+  WAITING_AGENT,
+  AGENT_AVAILABLE,
+  AGENT_CONNECTED,
+  AGENT_DISCONNECTED
+} state;
+
 sensor_msgs__msg__JointState cmd_msg;
 sensor_msgs__msg__JointState enc_msg;
 std_msgs__msg__Int32 PIDrate_msg;
@@ -69,6 +85,7 @@ long unsigned int nextUpdatePID = 0;
 long unsigned int nextUpdatePub = 0;
 long unsigned int lastUpdatePID = 0;
 long unsigned int PIDtimer = 0;
+long unsigned int lastMotorCmd = 0;
 
 //encoder ticks
 double M1_ticks = 0;
@@ -120,6 +137,54 @@ double M2_ITerm;
 double M3_ITerm;
 double M4_ITerm;
 
+bool create_entities()
+{
+  allocator = rcl_get_default_allocator();
+
+  //create init_options
+  RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
+
+  // create node
+  RCCHECK(rclc_node_init_default(&node, "littlebot_mcu_node", "", &support));
+
+  // create subscriber for motor commands
+  RCCHECK(rclc_subscription_init_default(
+    &subscriber_cmd_motor,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState),"mcu_cmd_motor"));
+
+  //create publisher for encoder values
+  RCCHECK(rclc_publisher_init_default(
+    &publisher_enc,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState),"enc_feedback"));
+
+  //create publisher for test data
+  RCCHECK(rclc_publisher_init_default(
+    &publisher_2,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),"test_int_pub"));
+
+  // create executor
+  RCCHECK(rclc_executor_init(&executor, &support.context, 4, &allocator));
+  RCCHECK(rclc_executor_add_subscription(&executor, &subscriber_cmd_motor, &cmd_msg, &subscription_callback_cmd_motor, ON_NEW_DATA));
+
+  return true;
+}
+
+void destroy_entities()
+{
+  rmw_context_t * rmw_context = rcl_context_get_rmw_context(&support.context);
+  (void) rmw_uros_set_context_entity_destroy_session_timeout(rmw_context, 0);
+
+  rcl_publisher_fini(&publisher_enc, &node);
+  rcl_publisher_fini(&publisher_2, &node);
+  rcl_timer_fini(&timer);
+  rclc_executor_fini(&executor);
+  rcl_node_fini(&node);
+  rclc_support_fini(&support);
+}
+
 void error_loop(){
    while(1){
     for(uint16_t i=0; i<strip.numPixels(); i++) {
@@ -158,9 +223,20 @@ void subscription_callback_cmd_motor(const void * msgin)
   M2_w_SetPoint = -(double)msg->velocity.data[1];
   M3_w_SetPoint = (double)msg->velocity.data[2];
   M4_w_SetPoint = (double)msg->velocity.data[3];
+  lastMotorCmd = millis();
 }
 void adjustMotorPWM(int M1_Pwm, int M2_Pwm, int M3_Pwm, int M4_Pwm)
 {
+  //turn off the motor if we haven't received a command in less than X ms
+  //odd place to put this, but does guarantee PWM goes to zero
+  //overrides the PID loop
+  if((millis() - lastMotorCmd > 200) || ((M1_w_SetPoint==0) && (M3_w_SetPoint==0))){
+    M1_Pwm = 0;
+    M2_Pwm = 0;
+    M3_Pwm = 0;
+    M4_Pwm = 0;
+  }
+
   if (M1_Pwm+M2_Pwm == 0) {
       analogWrite(M1_IN_A, 0);
       analogWrite(M1_IN_B, 0);
@@ -252,35 +328,7 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, HIGH);  
   
-  delay(2000);
-
-  allocator = rcl_get_default_allocator();
-
-  //create init_options
-  RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
-
-  // create node
-  RCCHECK(rclc_node_init_default(&node, "littlebot_mcu_node", "", &support));
-
-  // create subscriber
-  RCCHECK(rclc_subscription_init_default(
-    &subscriber_cmd_motor,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState),"mcu_cmd_motor"));
-
-  RCCHECK(rclc_publisher_init_default(
-    &publisher_enc,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState),"enc_feedback"));
-
-  RCCHECK(rclc_publisher_init_default(
-    &publisher_2,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),"test_int_pub"));
-
-  // create executor
-  RCCHECK(rclc_executor_init(&executor, &support.context, 4, &allocator));
-  RCCHECK(rclc_executor_add_subscription(&executor, &subscriber_cmd_motor, &cmd_msg, &subscription_callback_cmd_motor, ON_NEW_DATA));
+  delay(100);
 
   // Turn on the LEDs
   strip.begin();
@@ -336,100 +384,138 @@ void setup() {
   // enc_msg.name.data[3].data = "M4";
   // enc_msg.name.data[3].size = strlen("M4");
   // enc_msg.name.size = 4;
-  // fill in zeros
+
+  // fill in zeros to the encoder message
   for(int32_t i = 0; i < 4; i++){
     enc_msg.position.data[i] = 0;
     enc_msg.position.size++;
     enc_msg.velocity.data[i] = 0;
     enc_msg.velocity.size++;
   }
+
+  state = WAITING_AGENT;
 }
 
 void loop() {
-  //timer for ROS
-  if (millis() >= nextUpdateROS) {
-    nextUpdateROS = millis() +  sampleTimeROS;
-    RCCHECK(rclc_executor_spin_some(&executor, RCL_MS_TO_NS(100)));
-  }
-  //timer for publishing Encoders
-  if (millis() >= nextUpdatePub) {
-    nextUpdatePub = millis() +  sampleTimePub;
 
-    //publish the position
-    enc_msg.position.data[0]=-M1_theta_pub;
-    enc_msg.position.data[1]=-M2_theta_pub;
-    enc_msg.position.data[2]=M3_theta_pub;
-    enc_msg.position.data[3]=M4_theta_pub;
-    // //reset accumulator
-    M1_theta_pub = 0;
-    M2_theta_pub = 0;
-    M3_theta_pub = 0;
-    M4_theta_pub = 0;
-    //publish the velocity
-    enc_msg.velocity.data[0] = -M1_w;
-    enc_msg.velocity.data[1] = -M2_w;
-    enc_msg.velocity.data[2] = -M3_w;
-    enc_msg.velocity.data[3] = -M4_w;
-    // PIDrate_msg.data=52;
-    RCSOFTCHECK(rcl_publish(&publisher_enc, &enc_msg, NULL));
-    RCSOFTCHECK(rcl_publish(&publisher_2, &PIDrate_msg, NULL));
+  switch (state) {
+    case WAITING_AGENT:
+      EXECUTE_EVERY_N_MS(500, state = (RMW_RET_OK == rmw_uros_ping_agent(100, 1)) ? AGENT_AVAILABLE : WAITING_AGENT;);
+      break;
+    case AGENT_AVAILABLE:
+      state = (true == create_entities()) ? AGENT_CONNECTED : WAITING_AGENT;
+      if (state == WAITING_AGENT) {
+        destroy_entities();
+      };
+      break;
+    case AGENT_CONNECTED:
+      EXECUTE_EVERY_N_MS(200, state = (RMW_RET_OK == rmw_uros_ping_agent(100, 1)) ? AGENT_CONNECTED : AGENT_DISCONNECTED;);
+      // if (state == AGENT_CONNECTED) {
+      //   rclc_executor_spin_some(&executor, RCL_MS_TO_NS(100));
+      // }
+      break;
+    case AGENT_DISCONNECTED:
+      destroy_entities();
+      state = WAITING_AGENT;
+      break;
+    default:
+      break;
   }
 
-  //timer for PID loop
-  PIDtimer = millis();
-  if (PIDtimer >= nextUpdatePID)
-  {
-    nextUpdatePID = PIDtimer + sampleTimePID; //50ms sampling time
-    PIDrate_msg.data=PIDtimer-lastUpdatePID;
-    lastUpdatePID = PIDtimer;
-
-    // ch3Value = readChannel(RC_CH3, -1.0, 1.0, 0)/1000.0;
-    // if (ch3Value > 0.0){
-    //   ch1Value = readChannel(RC_CH1, w_min, w_max, 0)/1000.0;
-    //   ch2Value = readChannel(RC_CH2, w_min, w_max, 0)/1000.0;
-    //   M1_w_SetPoint = ch1Value;
-    //   M2_w_SetPoint = ch1Value;
-    //   M3_w_SetPoint = ch2Value;
-    //   M4_w_SetPoint = ch2Value;
-    // }
-    //Read the encoders
-    M1_ticks = M1_Enc.read();
-    M2_ticks = M2_Enc.read();
-    M3_ticks = M3_Enc.read();
-    M4_ticks = M4_Enc.read();
-
-    //Set encoder counts to zero
-    M1_Enc.write(0);
-    M2_Enc.write(0);
-    M3_Enc.write(0);
-    M4_Enc.write(0);
-
-    //calculate the angular rate measured from the encoder increment
-    //angular rate [rad/s] =  tickCount / ticksPerRev * rad per rev / gr * sample/second 
-    M1_w = M1_ticks / 1024.0 * 2.0 * 3.14159 / 18.0 * 1000 / sampleTimePID;
-    M2_w = M2_ticks / 1024.0 * 2.0 * 3.14159 / 18.0 * 1000 / sampleTimePID;
-    M3_w = M3_ticks / 1024.0 * 2.0 * 3.14159 / 18.0 * 1000 / sampleTimePID;
-    M4_w = M4_ticks / 1024.0 * 2.0 * 3.14159 / 18.0 * 1000 / sampleTimePID;
-
-    //accumulate rotation to be published
-    //assumes PID loop is sampling faster than pub
-    M1_theta_pub += M1_ticks / 1024.0 * 2.0 * 3.14159 / 18.0;
-    M2_theta_pub += M2_ticks / 1024.0 * 2.0 * 3.14159 / 18.0;
-    M3_theta_pub += M3_ticks / 1024.0 * 2.0 * 3.14159 / 18.0;
-    M4_theta_pub += M4_ticks / 1024.0 * 2.0 * 3.14159 / 18.0;
-
-    //Run the PID loop
-    M1_Pwm = motorPID(M1_w_SetPoint, M1_w, M1_w_LastSpeed, M1_Pwm, M1_ITerm);
-    M2_Pwm = motorPID(M2_w_SetPoint, M2_w, M2_w_LastSpeed, M2_Pwm, M2_ITerm);
-    M3_Pwm = motorPID(M3_w_SetPoint, M3_w, M3_w_LastSpeed, M3_Pwm, M3_ITerm);
-    M4_Pwm = motorPID(M4_w_SetPoint, M4_w, M4_w_LastSpeed, M4_Pwm, M4_ITerm);
-
-    //Write the Pwm to each motor
-    adjustMotorPWM(M1_Pwm,M2_Pwm,M3_Pwm,M4_Pwm);
-
-    for(uint16_t i=0; i<strip.numPixels(); i++) {
-    strip.setPixelColor(i, strip.Color(abs(M1_Pwm), 0, abs(M3_Pwm)));
+  if (state == AGENT_CONNECTED) {
+    //timer for ROS
+    if (millis() >= nextUpdateROS) {
+      nextUpdateROS = millis() +  sampleTimeROS;
+      RCCHECK(rclc_executor_spin_some(&executor, RCL_MS_TO_NS(100)));
     }
+    //timer for publishing Encoders
+    if (millis() >= nextUpdatePub) {
+      nextUpdatePub = millis() +  sampleTimePub;
+
+      //publish the position
+      enc_msg.position.data[0]=-M1_theta_pub;
+      enc_msg.position.data[1]=-M2_theta_pub;
+      enc_msg.position.data[2]=M3_theta_pub;
+      enc_msg.position.data[3]=M4_theta_pub;
+      // //reset accumulator
+      M1_theta_pub = 0;
+      M2_theta_pub = 0;
+      M3_theta_pub = 0;
+      M4_theta_pub = 0;
+      //publish the velocity
+      enc_msg.velocity.data[0] = -M1_w;
+      enc_msg.velocity.data[1] = -M2_w;
+      enc_msg.velocity.data[2] = -M3_w;
+      enc_msg.velocity.data[3] = -M4_w;
+      // PIDrate_msg.data=52;
+      RCSOFTCHECK(rcl_publish(&publisher_enc, &enc_msg, NULL));
+      RCSOFTCHECK(rcl_publish(&publisher_2, &PIDrate_msg, NULL));
+    }
+
+    //timer for PID loop
+    PIDtimer = millis();
+    if (PIDtimer >= nextUpdatePID)
+    {
+      nextUpdatePID = PIDtimer + sampleTimePID; //50ms sampling time
+      PIDrate_msg.data=PIDtimer-lastUpdatePID;
+      lastUpdatePID = PIDtimer;
+
+      // ch3Value = readChannel(RC_CH3, -1.0, 1.0, 0)/1000.0;
+      // if (ch3Value > 0.0){
+      //   ch1Value = readChannel(RC_CH1, w_min, w_max, 0)/1000.0;
+      //   ch2Value = readChannel(RC_CH2, w_min, w_max, 0)/1000.0;
+      //   M1_w_SetPoint = ch1Value;
+      //   M2_w_SetPoint = ch1Value;
+      //   M3_w_SetPoint = ch2Value;
+      //   M4_w_SetPoint = ch2Value;
+      // }
+      //Read the encoders
+      M1_ticks = M1_Enc.read();
+      M2_ticks = M2_Enc.read();
+      M3_ticks = M3_Enc.read();
+      M4_ticks = M4_Enc.read();
+
+      //Set encoder counts to zero
+      M1_Enc.write(0);
+      M2_Enc.write(0);
+      M3_Enc.write(0);
+      M4_Enc.write(0);
+
+      //calculate the angular rate measured from the encoder increment
+      //angular rate [rad/s] =  tickCount / ticksPerRev * rad per rev / gr * sample/second 
+      M1_w = M1_ticks / 1024.0 * 2.0 * 3.14159 / 18.0 * 1000 / sampleTimePID;
+      M2_w = M2_ticks / 1024.0 * 2.0 * 3.14159 / 18.0 * 1000 / sampleTimePID;
+      M3_w = M3_ticks / 1024.0 * 2.0 * 3.14159 / 18.0 * 1000 / sampleTimePID;
+      M4_w = M4_ticks / 1024.0 * 2.0 * 3.14159 / 18.0 * 1000 / sampleTimePID;
+
+      //accumulate rotation to be published
+      //assumes PID loop is sampling faster than pub
+      M1_theta_pub += M1_ticks / 1024.0 * 2.0 * 3.14159 / 18.0;
+      M2_theta_pub += M2_ticks / 1024.0 * 2.0 * 3.14159 / 18.0;
+      M3_theta_pub += M3_ticks / 1024.0 * 2.0 * 3.14159 / 18.0;
+      M4_theta_pub += M4_ticks / 1024.0 * 2.0 * 3.14159 / 18.0;
+
+      //Run the PID loop
+      M1_Pwm = motorPID(M1_w_SetPoint, M1_w, M1_w_LastSpeed, M1_Pwm, M1_ITerm);
+      M2_Pwm = motorPID(M2_w_SetPoint, M2_w, M2_w_LastSpeed, M2_Pwm, M2_ITerm);
+      M3_Pwm = motorPID(M3_w_SetPoint, M3_w, M3_w_LastSpeed, M3_Pwm, M3_ITerm);
+      M4_Pwm = motorPID(M4_w_SetPoint, M4_w, M4_w_LastSpeed, M4_Pwm, M4_ITerm);
+
+      //Write the Pwm to each motor
+      adjustMotorPWM(M1_Pwm,M2_Pwm,M3_Pwm,M4_Pwm);
+
+      for(uint16_t i=0; i<strip.numPixels(); i++) {
+      strip.setPixelColor(i, strip.Color(abs(M1_Pwm), 0, abs(M3_Pwm)));
+      }
+      strip.show();
+    }
+  }
+  else {
+    //change lights yellow
+    //TODO add a timer to flash lights
+    for(uint16_t i=0; i<strip.numPixels(); i++) {
+      strip.setPixelColor(i, strip.Color(abs(155), abs(100), 0));
+      }
     strip.show();
   }
 }
