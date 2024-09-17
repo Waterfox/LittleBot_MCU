@@ -86,6 +86,7 @@ long unsigned int nextUpdatePub = 0;
 long unsigned int lastUpdatePID = 0;
 long unsigned int PIDtimer = 0;
 long unsigned int lastMotorCmd = 0;
+long unsigned int lastNonZeroVelCmd =0;
 
 //encoder ticks
 double M1_ticks = 0;
@@ -128,10 +129,10 @@ float ch1Value, ch2Value, ch3Value, ch4Value;
 int test_count = 0;
 
 //PID Params
-double _kP = 3.2;
-double _kI = 0.011;//0.0002;
-double _kD = 0.0022;//0.00000005;
-double Max_ITerm = 5.0;
+double _kP = 1.5;
+double _kI = 0.0005;//0.0002;
+double _kD = 0.00002;//0.00000005;
+double Max_ITerm = 0.005;
 double M1_ITerm;
 double M2_ITerm;
 double M3_ITerm;
@@ -140,13 +141,16 @@ double M4_ITerm;
 bool create_entities()
 {
   allocator = rcl_get_default_allocator();
-
   //create init_options
   RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
-
+  rcl_init_options_t init_options = rcl_get_zero_initialized_init_options();
+  rcl_init_options_init(&init_options, allocator);
+  size_t domain_id = (size_t)(1);
+  rcl_init_options_set_domain_id(&init_options, domain_id);
+  //create support, add init_options
+  rclc_support_init_with_options(&support, 0, NULL, &init_options, &allocator);
   // create node
   RCCHECK(rclc_node_init_default(&node, "littlebot_mcu_node", "", &support));
-
   // create subscriber for motor commands
   RCCHECK(rclc_subscription_init_default(
     &subscriber_cmd_motor,
@@ -224,18 +228,26 @@ void subscription_callback_cmd_motor(const void * msgin)
   M3_w_SetPoint = (double)msg->velocity.data[2];
   M4_w_SetPoint = (double)msg->velocity.data[3];
   lastMotorCmd = millis();
+  if ((M1_w_SetPoint != 0) && (M3_w_SetPoint != 0)){
+    lastNonZeroVelCmd = millis();
+  }
 }
 void adjustMotorPWM(int M1_Pwm, int M2_Pwm, int M3_Pwm, int M4_Pwm)
 {
   //turn off the motor if we haven't received a command in less than X ms
   //odd place to put this, but does guarantee PWM goes to zero
   //overrides the PID loop
-  if((millis() - lastMotorCmd > 200) || ((M1_w_SetPoint==0) && (M3_w_SetPoint==0))){
+  // if((millis() - lastMotorCmd > 1000) || ((M1_w_SetPoint==0) && (M3_w_SetPoint==0))){
+  long t1 = millis();
+  // if ((t1 - lastMotorCmd > 500) || (t1 - lastNonZeroVelCmd > 1000)) {
+  if (t1 - lastMotorCmd > 500){
+  // if(t1 - lastNonZeroVelCmd > 1000) {
     M1_Pwm = 0;
     M2_Pwm = 0;
     M3_Pwm = 0;
     M4_Pwm = 0;
   }
+
 
   if (M1_Pwm+M2_Pwm == 0) {
       analogWrite(M1_IN_A, 0);
